@@ -313,6 +313,47 @@ export class CDPService extends EventEmitter {
     }
   }
 
+  private getPreferredAcceptLanguage(): string | undefined {
+    return (
+      this.launchConfig?.customHeaders?.["accept-language"] ||
+      this.launchConfig?.antiDetection?.acceptLanguage ||
+      env.DEFAULT_HEADERS?.["accept-language"]
+    );
+  }
+
+  private getPreferredLocale(): string {
+    const acceptLanguage = this.getPreferredAcceptLanguage();
+    return (
+      this.launchConfig?.antiDetection?.locale ||
+      acceptLanguage?.split(",")[0]?.split(";")[0]?.trim() ||
+      "en-US"
+    );
+  }
+
+  private buildOrderedHeaders(
+    sourceHeaders: Record<string, string>,
+    overrides: Record<string, string>,
+    preferredOrder: string[],
+  ): Record<string, string> {
+    const ordered: Record<string, string> = {};
+    const source = { ...sourceHeaders, ...overrides };
+
+    for (const key of preferredOrder) {
+      const value = source[key];
+      if (typeof value === "string" && value.length > 0) {
+        ordered[key] = value;
+      }
+    }
+
+    for (const [key, value] of Object.entries(source)) {
+      if (!(key in ordered) && typeof value === "string" && value.length > 0) {
+        ordered[key] = value;
+      }
+    }
+
+    return ordered;
+  }
+
   private async handleNewTarget(target: Target) {
     try {
       await this.targetInstrumentationManager.attach(target, target.type() as TargetType);
@@ -346,12 +387,16 @@ export class CDPService extends EventEmitter {
           installMouseHelper(page, this.launchConfig?.deviceConfig?.device || "desktop");
         }
 
-        if (this.launchConfig?.customHeaders) {
+        if (this.launchConfig?.antiDetection?.enabled && this.launchConfig?.antiDetection?.acceptLanguage) {
+          await page.setExtraHTTPHeaders({
+            "accept-language": this.launchConfig.antiDetection.acceptLanguage,
+          });
+        } else if (!this.launchConfig?.antiDetection?.enabled && this.launchConfig?.customHeaders) {
           await page.setExtraHTTPHeaders({
             ...env.DEFAULT_HEADERS,
             ...this.launchConfig.customHeaders,
           });
-        } else if (env.DEFAULT_HEADERS) {
+        } else if (!this.launchConfig?.antiDetection?.enabled && env.DEFAULT_HEADERS) {
           await page.setExtraHTTPHeaders(env.DEFAULT_HEADERS);
         }
 
@@ -388,7 +433,11 @@ export class CDPService extends EventEmitter {
   private async handlePageRequest(request: HTTPRequest, page: Page) {
     const url = request.url();
     const headers = request.headers();
-    delete headers["accept-language"]; // Patch to help with headless detection
+    const antiDetection = this.launchConfig?.antiDetection;
+    const preferredAcceptLanguage = this.getPreferredAcceptLanguage();
+    if (!headers["accept-language"] && preferredAcceptLanguage) {
+      headers["accept-language"] = preferredAcceptLanguage;
+    }
 
     const parsed = tryParseUrl(url);
 
@@ -431,6 +480,38 @@ export class CDPService extends EventEmitter {
         await request.abort();
         return;
       }
+    }
+
+    if (antiDetection?.enabled && request.resourceType() === "document") {
+      const navigationHeaders = antiDetection.navigationHeaders;
+      const orderedHeaders = this.buildOrderedHeaders(
+        headers,
+        {
+          accept: navigationHeaders.accept,
+          "sec-ch-ua": navigationHeaders.secChUa,
+          "sec-ch-ua-mobile": navigationHeaders.secChUaMobile,
+          "sec-ch-ua-platform": navigationHeaders.secChUaPlatform,
+          "upgrade-insecure-requests": navigationHeaders.upgradeInsecureRequests,
+        },
+        [
+          "sec-ch-ua",
+          "sec-ch-ua-mobile",
+          "sec-ch-ua-platform",
+          "upgrade-insecure-requests",
+          "user-agent",
+          "accept",
+          "sec-fetch-site",
+          "sec-fetch-mode",
+          "sec-fetch-user",
+          "sec-fetch-dest",
+          "referer",
+          "accept-encoding",
+          "accept-language",
+        ],
+      );
+
+      await request.continue({ headers: orderedHeaders });
+      return;
     }
 
     if (url.startsWith("file://")) {
@@ -667,34 +748,48 @@ export class CDPService extends EventEmitter {
         // Fingerprint generation - can fail gracefully
         if (
           !env.SKIP_FINGERPRINT_INJECTION &&
-          !userAgent &&
           !this.launchConfig.skipFingerprintInjection &&
           !this.fingerprintData
         ) {
           await executeCritical(
             async () => {
+              const antiDetection = this.launchConfig?.antiDetection;
               let fingerprintOptions: Partial<FingerprintGeneratorOptions> = {
-                devices: ["desktop"],
-                operatingSystems: ["linux"],
+                devices: [antiDetection?.device || "desktop"],
+                operatingSystems: antiDetection?.fingerprintOperatingSystems || ["linux"],
                 browsers: [{ name: "chrome", minVersion: 136 }],
-                locales: ["en-US", "en"],
+                locales: antiDetection?.fingerprintLocales || ["en-US", "en"],
                 screen: {
-                  minWidth: this.launchConfig!.dimensions?.width ?? 1920,
-                  minHeight: this.launchConfig!.dimensions?.height ?? 1080,
-                  maxWidth: this.launchConfig!.dimensions?.width ?? 1920,
-                  maxHeight: this.launchConfig!.dimensions?.height ?? 1080,
+                  minWidth: this.launchConfig!.dimensions?.width ?? antiDetection?.dimensions.width ?? 1920,
+                  minHeight: this.launchConfig!.dimensions?.height ?? antiDetection?.dimensions.height ?? 1080,
+                  maxWidth: this.launchConfig!.dimensions?.width ?? antiDetection?.dimensions.width ?? 1920,
+                  maxHeight: this.launchConfig!.dimensions?.height ?? antiDetection?.dimensions.height ?? 1080,
                 },
               };
 
               if (this.launchConfig!.deviceConfig?.device === "mobile") {
                 fingerprintOptions = {
                   devices: ["mobile"],
-                  locales: ["en-US", "en"],
+                  locales: antiDetection?.fingerprintLocales || ["en-US", "en"],
                 };
               }
 
               const fingerprintGen = new FingerprintGenerator(fingerprintOptions);
               this.fingerprintData = fingerprintGen.getFingerprint();
+
+              if (this.fingerprintData && antiDetection?.enabled) {
+                this.fingerprintData.fingerprint.navigator.userAgent =
+                  this.launchConfig?.userAgent || antiDetection.userAgent;
+                this.fingerprintData.fingerprint.navigator.platform = antiDetection.navigatorPlatform;
+                this.fingerprintData.fingerprint.navigator.vendor = antiDetection.vendor;
+                this.fingerprintData.headers["accept-language"] = antiDetection.acceptLanguage;
+                this.fingerprintData.headers["accept"] = antiDetection.accept;
+                this.fingerprintData.headers["sec-ch-ua"] = antiDetection.navigationHeaders.secChUa;
+                this.fingerprintData.headers["sec-ch-ua-mobile"] =
+                  antiDetection.navigationHeaders.secChUaMobile;
+                this.fingerprintData.headers["sec-ch-ua-platform"] =
+                  antiDetection.navigationHeaders.secChUaPlatform;
+              }
             },
             (error) => {
               this.logger.error({ err: error }, "[CDPService] Error generating fingerprint");
@@ -862,6 +957,9 @@ export class CDPService extends EventEmitter {
 
         const launchArgs = uniq([
           ...staticDefaultArgs,
+          ...(this.launchConfig?.antiDetection?.enabled
+            ? [`--lang=${this.getPreferredLocale()}`]
+            : []),
           ...(isHeadless ? headlessArgs : headfulArgs),
           ...dynamicArgs,
           ...extensionArgs,
@@ -1374,6 +1472,11 @@ export class CDPService extends EventEmitter {
       // TypeScript fix - access userAgent through navigator property
       const userAgent = fingerprint.navigator.userAgent;
       const userAgentMetadata = fingerprint.navigator.userAgentData;
+      const antiDetection = this.launchConfig?.antiDetection;
+      const acceptLanguage =
+        antiDetection?.acceptLanguage || this.getPreferredAcceptLanguage() || headers["accept-language"] ||
+        "en-US,en;q=0.9";
+      const locale = this.getPreferredLocale();
       const { screen } = fingerprint;
 
       await page.setUserAgent(userAgent);
@@ -1401,47 +1504,74 @@ export class CDPService extends EventEmitter {
           deviceScaleFactor: screen.devicePixelRatio,
         });
 
-        const injectedHeaders = filterHeaders(headers);
+        if (!antiDetection?.enabled) {
+          const injectedHeaders = filterHeaders(headers);
+          injectedHeaders["accept-language"] = acceptLanguage;
 
-        await page.setExtraHTTPHeaders(injectedHeaders);
+          await page.setExtraHTTPHeaders(injectedHeaders);
+        }
 
         await session.send("Emulation.setUserAgentOverride", {
           userAgent: userAgent,
-          acceptLanguage: headers["accept-language"],
-          platform: fingerprint.navigator.platform || "Linux x86_64",
+          platform:
+            antiDetection?.navigatorPlatform || fingerprint.navigator.platform || "Linux x86_64",
           userAgentMetadata: {
             brands:
-              userAgentMetadata.brands as unknown as Protocol.Emulation.UserAgentMetadata["brands"],
+              (antiDetection?.userAgentMetadata.brands ||
+                (userAgentMetadata.brands as unknown as Protocol.Emulation.UserAgentMetadata["brands"])) as Protocol.Emulation.UserAgentMetadata["brands"],
             fullVersionList:
-              userAgentMetadata.fullVersionList as unknown as Protocol.Emulation.UserAgentMetadata["fullVersionList"],
-            fullVersion: userAgentMetadata.uaFullVersion,
-            platform: fingerprint.navigator.platform || "Linux x86_64",
-            platformVersion: userAgentMetadata.platformVersion || "",
-            architecture: userAgentMetadata.architecture || "x86",
-            model: userAgentMetadata.model || "",
-            mobile: userAgentMetadata.mobile as unknown as boolean,
-            bitness: userAgentMetadata.bitness || "64",
-            wow64: false, // wow64 property doesn't exist on UserAgentData, defaulting to false
+              (antiDetection?.userAgentMetadata.fullVersionList ||
+                (userAgentMetadata.fullVersionList as unknown as Protocol.Emulation.UserAgentMetadata["fullVersionList"])) as Protocol.Emulation.UserAgentMetadata["fullVersionList"],
+            fullVersion:
+              antiDetection?.userAgentMetadata.fullVersion || userAgentMetadata.uaFullVersion,
+            platform:
+              antiDetection?.userAgentMetadata.platform ||
+              antiDetection?.navigatorPlatform ||
+              fingerprint.navigator.platform ||
+              "Linux x86_64",
+            platformVersion:
+              antiDetection?.userAgentMetadata.platformVersion || userAgentMetadata.platformVersion || "",
+            architecture:
+              antiDetection?.userAgentMetadata.architecture || userAgentMetadata.architecture || "x86",
+            model: antiDetection?.userAgentMetadata.model || userAgentMetadata.model || "",
+            mobile:
+              antiDetection?.userAgentMetadata.mobile ??
+              (userAgentMetadata.mobile as unknown as boolean),
+            bitness:
+              antiDetection?.userAgentMetadata.bitness || userAgentMetadata.bitness || "64",
+            wow64: antiDetection?.userAgentMetadata.wow64 ?? false,
           },
+        });
+
+        await session.send("Emulation.setLocaleOverride", {
+          locale,
         });
       } finally {
         // Always detach the session when done
         await session.detach().catch(() => {});
       }
 
+      await this.injectAutomationHardening(page, fingerprintData);
+
       await page.evaluateOnNewDocument(
         loadFingerprintScript({
-          fixedPlatform: fingerprint.navigator.platform || "Linux x86_64",
+          fixedPlatform:
+            antiDetection?.navigatorPlatform || fingerprint.navigator.platform || "Linux x86_64",
           fixedVendor: (fingerprint.videoCard as VideoCard | null)?.vendor,
           fixedRenderer: (fingerprint.videoCard as VideoCard | null)?.renderer,
           fixedDeviceMemory: fingerprint.navigator.deviceMemory || 8,
           fixedHardwareConcurrency: fingerprint.navigator.hardwareConcurrency || 8,
-          fixedArchitecture: userAgentMetadata.architecture || "x86",
-          fixedBitness: userAgentMetadata.bitness || "64",
-          fixedModel: userAgentMetadata.model || "",
-          fixedPlatformVersion: userAgentMetadata.platformVersion || "15.0.0",
-          fixedUaFullVersion: userAgentMetadata.uaFullVersion || "131.0.6778.86",
+          fixedArchitecture:
+            antiDetection?.userAgentMetadata.architecture || userAgentMetadata.architecture || "x86",
+          fixedBitness:
+            antiDetection?.userAgentMetadata.bitness || userAgentMetadata.bitness || "64",
+          fixedModel: antiDetection?.userAgentMetadata.model || userAgentMetadata.model || "",
+          fixedPlatformVersion:
+            antiDetection?.userAgentMetadata.platformVersion || userAgentMetadata.platformVersion || "10.0.0",
+          fixedUaFullVersion:
+            antiDetection?.userAgentMetadata.fullVersion || userAgentMetadata.uaFullVersion || "145.0.0.0",
           fixedBrands:
+            antiDetection?.userAgentMetadata.brands ||
             userAgentMetadata.brands ||
             ([] as unknown as Array<{
               brand: string;
@@ -1455,6 +1585,190 @@ export class CDPService extends EventEmitter {
       // @ts-ignore - Ignore type mismatch between puppeteer versions
       await fingerprintInjector.attachFingerprintToPuppeteer(page, fingerprintData);
     }
+  }
+
+  @traceable
+  private async injectAutomationHardening(
+    page: Page,
+    fingerprintData: BrowserFingerprintWithHeaders | null,
+  ) {
+    const fingerprint = fingerprintData?.fingerprint;
+    const acceptLanguage = this.getPreferredAcceptLanguage();
+    const antiDetection = this.launchConfig?.antiDetection;
+    const languages = antiDetection?.languages?.length
+      ? antiDetection.languages
+      : acceptLanguage
+          ?.split(",")
+          .map((entry) => entry.split(";")[0]?.trim())
+          .filter(Boolean) || ["en-US", "en"];
+    const navigatorData = fingerprint?.navigator;
+    const pluginNames = [
+      "PDF Viewer",
+      "Chrome PDF Viewer",
+      "Chromium PDF Viewer",
+      "Microsoft Edge PDF Viewer",
+      "WebKit built-in PDF",
+    ];
+
+    await page.evaluateOnNewDocument(
+      ({ languages, platform, vendor, hardwareConcurrency, deviceMemory, pluginNames, brands, fullVersion }) => {
+        const defineValue = (target: object, key: string, value: unknown) => {
+          try {
+            Object.defineProperty(target, key, {
+              configurable: true,
+              get: () => value,
+            });
+          } catch (_error) {}
+        };
+
+        const patchIntlResolvedOptions = (
+          IntlConstructor:
+            | typeof Intl.DateTimeFormat
+            | typeof Intl.NumberFormat
+            | typeof Intl.Collator
+            | typeof Intl.PluralRules
+            | typeof Intl.RelativeTimeFormat
+            | typeof Intl.ListFormat
+            | typeof Intl.DisplayNames
+            | undefined,
+        ) => {
+          if (!IntlConstructor?.prototype?.resolvedOptions) {
+            return;
+          }
+
+          const originalResolvedOptions = IntlConstructor.prototype.resolvedOptions;
+          IntlConstructor.prototype.resolvedOptions = function (...args: unknown[]) {
+            const options = originalResolvedOptions.apply(this, args as []);
+            return {
+              ...options,
+              locale: languages[0] || "en-US",
+            };
+          };
+        };
+
+        const makeNamedArray = <T extends Record<string, unknown>>(items: T[], nameKey: keyof T) => {
+          const list = items.slice() as T[] & {
+            item: (index: number) => T | null;
+            namedItem: (name: string) => T | null;
+          };
+          list.item = (index) => list[index] || null;
+          list.namedItem = (name) => list.find((item) => item?.[nameKey] === name) || null;
+          return list;
+        };
+
+        const mimeTypes = makeNamedArray(
+          pluginNames.map((name) => ({
+            type: "application/pdf",
+            suffixes: "pdf",
+            description: "Portable Document Format",
+            enabledPlugin: null as unknown,
+            name,
+          })),
+          "type",
+        );
+        const plugins = makeNamedArray(
+          pluginNames.map((name) => ({
+            name,
+            filename: "internal-pdf-viewer",
+            description: "Portable Document Format",
+            length: 1,
+            0: mimeTypes[0],
+          })),
+          "name",
+        );
+
+        mimeTypes.forEach((mimeType) => {
+          mimeType.enabledPlugin = plugins[0];
+        });
+
+        defineValue(Navigator.prototype, "webdriver", undefined);
+        defineValue(Navigator.prototype, "languages", languages);
+        defineValue(Navigator.prototype, "language", languages[0] || "en-US");
+        defineValue(Navigator.prototype, "platform", platform || "Win32");
+        defineValue(Navigator.prototype, "vendor", vendor || "Google Inc.");
+        defineValue(Navigator.prototype, "hardwareConcurrency", hardwareConcurrency || 8);
+        defineValue(Navigator.prototype, "deviceMemory", deviceMemory || 8);
+        defineValue(Navigator.prototype, "plugins", plugins);
+        defineValue(Navigator.prototype, "mimeTypes", mimeTypes);
+        defineValue(Navigator.prototype, "pdfViewerEnabled", true);
+        const userAgentData = {
+          brands,
+          mobile: false,
+          platform: platform === "Win32" ? "Windows" : platform,
+          getHighEntropyValues: async () => ({
+            brands,
+            fullVersionList: brands.map((brand) => ({
+              brand: brand.brand,
+              version: brand.version + ".0",
+            })),
+            fullVersion: fullVersion || (brands[1]?.version ? `${brands[1].version}.0.0` : "145.0.0.0"),
+            platform: platform === "Win32" ? "Windows" : platform,
+            platformVersion: "10.0.0",
+            architecture: "x86",
+            model: "",
+            mobile: false,
+            bitness: "64",
+            wow64: false,
+          }),
+          toJSON: () => ({
+            brands,
+            mobile: false,
+            platform: platform === "Win32" ? "Windows" : platform,
+          }),
+        };
+        defineValue(Navigator.prototype, "userAgentData", userAgentData);
+        patchIntlResolvedOptions(Intl.DateTimeFormat);
+        patchIntlResolvedOptions(Intl.NumberFormat);
+        patchIntlResolvedOptions(Intl.Collator);
+        patchIntlResolvedOptions(Intl.PluralRules);
+        patchIntlResolvedOptions(Intl.RelativeTimeFormat);
+        patchIntlResolvedOptions(Intl.ListFormat);
+        patchIntlResolvedOptions(Intl.DisplayNames);
+
+        const chromeValue = (window as Window & { chrome?: unknown }).chrome || {
+          runtime: {},
+          app: {
+            isInstalled: false,
+            InstallState: {
+              DISABLED: "disabled",
+              INSTALLED: "installed",
+              NOT_INSTALLED: "not_installed",
+            },
+            RunningState: {
+              CANNOT_RUN: "cannot_run",
+              READY_TO_RUN: "ready_to_run",
+              RUNNING: "running",
+            },
+          },
+        };
+        defineValue(window as Window & { chrome?: unknown }, "chrome", chromeValue);
+
+        if (navigator.permissions?.query) {
+          const originalQuery = navigator.permissions.query.bind(navigator.permissions);
+          navigator.permissions.query = async (parameters: PermissionDescriptor) => {
+            if (parameters?.name === "notifications") {
+              return { state: Notification.permission } as PermissionStatus;
+            }
+            return originalQuery(parameters);
+          };
+        }
+      },
+        {
+          languages,
+          platform: antiDetection?.navigatorPlatform || navigatorData?.platform || "Win32",
+          vendor: antiDetection?.vendor || navigatorData?.vendor || "Google Inc.",
+          hardwareConcurrency: navigatorData?.hardwareConcurrency || 8,
+          deviceMemory: navigatorData?.deviceMemory || 8,
+          pluginNames,
+          brands:
+            antiDetection?.userAgentMetadata.brands ||
+            (fingerprint?.navigator.userAgentData?.brands as unknown as Array<{ brand: string; version: string }>),
+          fullVersion:
+            antiDetection?.userAgentMetadata.fullVersion ||
+            fingerprint?.navigator.userAgentData?.uaFullVersion ||
+            "145.0.0.0",
+        },
+      );
   }
 
   @traceable

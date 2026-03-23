@@ -18,73 +18,103 @@ export const SessionCredentials = z
   .optional()
   .describe("Configuration for session credentials");
 
-const CreateSession = z.object({
-  sessionId: z.string().uuid().optional().describe("Unique identifier for the session"),
-  proxyUrl: z.string().optional().describe("Proxy URL to use for the session"),
-  userAgent: z.string().optional().describe("User agent string to use for the session"),
-  sessionContext: SessionContextSchema.optional().describe(
-    "Session context data to be used in the created session",
-  ),
-  isSelenium: z.boolean().optional().describe("Indicates if Selenium is used in the session"),
-  blockAds: z
-    .boolean()
-    .optional()
-    .describe("Flag to indicate if ads should be blocked in the session"),
-  optimizeBandwidth: z
-    .union([
-      z.boolean(),
-      z
-        .object({
-          blockImages: z.boolean().optional(),
-          blockMedia: z.boolean().optional(),
-          blockStylesheets: z.boolean().optional(),
-          blockHosts: z.array(z.string()).optional(),
-          blockUrlPatterns: z.array(z.string()).optional(),
-        })
-        .strict(),
-    ])
-    .optional()
-    .describe(
-      "Enable bandwidth optimizations. Passing true enables all flags (except hosts/patterns). Object allows granular control.",
+const AntiDetectionPreset = z
+  .enum(["default", "windows_kr"])
+  .describe("Server-managed anti-detection profile preset");
+
+const AntiDetectionConfig = z
+  .object({
+    enabled: z.boolean().optional().default(true).describe("Enable anti-detection profile"),
+    preset: AntiDetectionPreset.optional().default("default"),
+    mode: z
+      .enum(["balanced", "strict"])
+      .optional()
+      .default("strict")
+      .describe("Anti-detection hardening mode"),
+  })
+  .optional()
+  .describe("Anti-detection profile configuration. Omitted requests default to enabled preset behavior.");
+
+const CreateSession = z
+  .object({
+    sessionId: z.string().uuid().optional().describe("Unique identifier for the session"),
+    proxyUrl: z.string().optional().describe("Proxy URL to use for the session"),
+    userAgent: z.string().optional().describe("User agent string to use for the session"),
+    sessionContext: SessionContextSchema.optional().describe(
+      "Session context data to be used in the created session",
     ),
-  skipFingerprintInjection: z
-    .boolean()
-    .optional()
-    .describe("Flag to indicate if fingerprint injection should be skipped for this session."),
-  deviceConfig: z
-    .object({
-      device: z.enum(["desktop", "mobile"]).default("desktop"),
-    })
-    .optional()
-    .describe(
-      "Device configuration for the session. Specify 'mobile' for mobile device fingerprints and configurations.",
-    ),
-  // Specific to hosted steel
-  logSinkUrl: z.string().optional().describe("Deprecated: Log sink URL to use for the session"),
-  extensions: z.array(z.string()).optional().describe("Extensions to use for the session"),
-  persist: z.boolean().optional().describe("Flag to indicate if session should be persisted"),
-  userDataDir: z.string().optional().describe("User data directory path to use for the session"),
-  timezone: z.string().optional().describe("Timezone to use for the session"),
-  dimensions: z
-    .object({
-      width: z.number(),
-      height: z.number(),
-    })
-    .optional()
-    .describe("Dimensions to use for the session"),
-  userPreferences: z
-    .record(z.string(), z.any())
-    .optional()
-    .describe(
-      "Chrome user preferences to customize browser behavior (e.g., font size, popup blocking, notification settings)",
-    ),
-  extra: z
-    .record(z.string(), z.any())
-    .optional()
-    .describe("Extra metadata to help initialize the session"),
-  credentials: SessionCredentials,
-  headless: z.boolean().optional().describe("Headless mode for the session"),
-});
+    isSelenium: z.boolean().optional().describe("Indicates if Selenium is used in the session"),
+    blockAds: z
+      .boolean()
+      .optional()
+      .describe("Flag to indicate if ads should be blocked in the session"),
+    optimizeBandwidth: z
+      .union([
+        z.boolean(),
+        z
+          .object({
+            blockImages: z.boolean().optional(),
+            blockMedia: z.boolean().optional(),
+            blockStylesheets: z.boolean().optional(),
+            blockHosts: z.array(z.string()).optional(),
+            blockUrlPatterns: z.array(z.string()).optional(),
+          })
+          .strict(),
+      ])
+      .optional()
+      .describe(
+        "Enable bandwidth optimizations. Passing true enables all flags (except hosts/patterns). Object allows granular control.",
+      ),
+    skipFingerprintInjection: z
+      .boolean()
+      .optional()
+      .describe("Flag to indicate if fingerprint injection should be skipped for this session."),
+    deviceConfig: z
+      .object({
+        device: z.enum(["desktop", "mobile"]).default("desktop"),
+      })
+      .optional()
+      .describe(
+        "Device configuration for the session. Specify 'mobile' for mobile device fingerprints and configurations.",
+      ),
+    antiDetection: AntiDetectionConfig,
+    // Specific to hosted steel
+    logSinkUrl: z.string().optional().describe("Deprecated: Log sink URL to use for the session"),
+    extensions: z.array(z.string()).optional().describe("Extensions to use for the session"),
+    persist: z.boolean().optional().describe("Flag to indicate if session should be persisted"),
+    userDataDir: z.string().optional().describe("User data directory path to use for the session"),
+    timezone: z.string().optional().describe("Timezone to use for the session"),
+    dimensions: z
+      .object({
+        width: z.number(),
+        height: z.number(),
+      })
+      .optional()
+      .describe("Dimensions to use for the session"),
+    userPreferences: z
+      .record(z.string(), z.any())
+      .optional()
+      .describe(
+        "Chrome user preferences to customize browser behavior (e.g., font size, popup blocking, notification settings)",
+      ),
+    extra: z
+      .record(z.string(), z.any())
+      .optional()
+      .describe("Extra metadata to help initialize the session"),
+    credentials: SessionCredentials,
+    headless: z.boolean().optional().describe("Headless mode for the session"),
+  })
+  .superRefine((data, ctx) => {
+    const antiDetectionEnabled = data.antiDetection?.enabled ?? true;
+    if (antiDetectionEnabled && data.skipFingerprintInjection) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["skipFingerprintInjection"],
+        message:
+          "skipFingerprintInjection cannot be enabled while antiDetection is enabled.",
+      });
+    }
+  });
 
 const SessionDetails = z.object({
   id: z.string().uuid().describe("Unique identifier for the session"),
@@ -117,6 +147,14 @@ const SessionDetails = z.object({
     .int()
     .nonnegative()
     .describe("Amount of data received through the proxy"),
+  antiDetection: z
+    .object({
+      enabled: z.boolean(),
+      preset: AntiDetectionPreset,
+      mode: z.enum(["balanced", "strict"]),
+    })
+    .optional()
+    .describe("Applied anti-detection configuration for the session"),
   solveCaptcha: z.boolean().optional().describe("Indicates if captcha solving is enabled"),
   isSelenium: z.boolean().optional().describe("Indicates if Selenium is used in the session"),
 });

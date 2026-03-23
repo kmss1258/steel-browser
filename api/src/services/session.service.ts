@@ -16,6 +16,8 @@ import { FileService } from "./file.service.js";
 import { SeleniumService } from "./selenium.service.js";
 import { TimezoneFetcher } from "./timezone-fetcher.service.js";
 import { deepMerge } from "../utils/context.js";
+import { resolveAntiDetection } from "../utils/anti-detection.js";
+import { AntiDetectionOptions } from "../types/browser.js";
 
 type Session = SessionDetails & {
   completion: Promise<void>;
@@ -40,10 +42,11 @@ const defaultSession = {
   sessionViewerUrl: getBaseUrl(),
   dimensions: { width: 1920, height: 1080 },
   userAgent: "",
+  antiDetection: { enabled: true as const, preset: "default" as const, mode: "strict" as const },
   isSelenium: false,
   proxy: "",
   solveCaptcha: false,
-};
+} satisfies Partial<SessionDetails>;
 
 export type ProxyFactory = (proxyUrl: string) => Promise<IProxyServer> | IProxyServer;
 
@@ -107,6 +110,7 @@ export class SessionService {
     deviceConfig?: { device: "desktop" | "mobile" };
     headless?: boolean;
     dangerouslyLogRequestDetails?: boolean;
+    antiDetection?: AntiDetectionOptions;
   }): Promise<SessionDetails> {
     const {
       sessionId,
@@ -127,12 +131,23 @@ export class SessionService {
       deviceConfig,
       headless,
       dangerouslyLogRequestDetails,
+      antiDetection,
     } = options;
+
+    const resolvedAntiDetection = resolveAntiDetection({
+      antiDetection,
+      userAgent,
+      timezone: options.timezone,
+      dimensions,
+      deviceConfig,
+    });
 
     // start fetching timezone as early as possible
     let timezonePromise: Promise<string>;
     if (options.timezone) {
       timezonePromise = Promise.resolve(options.timezone);
+    } else if (resolvedAntiDetection.enabled) {
+      timezonePromise = Promise.resolve(resolvedAntiDetection.timezone);
     } else {
       timezonePromise = this.timezoneFetcher.getTimezone(
         proxyUrl,
@@ -150,6 +165,11 @@ export class SessionService {
       solveCaptcha: false,
       dimensions: finalDimensions,
       isSelenium,
+      antiDetection: {
+        enabled: resolvedAntiDetection.enabled,
+        preset: resolvedAntiDetection.preset,
+        mode: resolvedAntiDetection.mode,
+      },
     });
 
     const userDataDir =
@@ -195,20 +215,23 @@ export class SessionService {
         proxyUrl: this.activeSession.proxyServer?.url,
       },
       sessionContext,
-      userAgent,
+      userAgent: resolvedAntiDetection.enabled ? resolvedAntiDetection.userAgent : userAgent,
       blockAds,
       fingerprint,
       optimizeBandwidth: normalizedOptimize,
       extensions: extensions || [],
       logSinkUrl,
       timezone: timezonePromise,
-      dimensions,
+      dimensions: resolvedAntiDetection.enabled ? resolvedAntiDetection.dimensions : dimensions,
+      antiDetection: resolvedAntiDetection,
       userDataDir,
       userPreferences: mergedUserPreferences,
       extra,
       credentials,
       skipFingerprintInjection,
-      deviceConfig,
+      deviceConfig: resolvedAntiDetection.enabled
+        ? { device: resolvedAntiDetection.device }
+        : deviceConfig,
       dangerouslyLogRequestDetails,
     };
 
@@ -221,7 +244,7 @@ export class SessionService {
         debugUrl: "",
         sessionViewerUrl: "",
         userAgent:
-          userAgent ||
+          (resolvedAntiDetection.enabled ? resolvedAntiDetection.userAgent : userAgent) ||
           "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
         dimensions: this.cdpService.getDimensions(),
       });
@@ -237,8 +260,15 @@ export class SessionService {
         sessionViewerUrl: getBaseUrl(),
         userAgent:
           this.cdpService.getUserAgent() ||
-          "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+          (resolvedAntiDetection.enabled
+            ? resolvedAntiDetection.userAgent
+            : "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"),
         dimensions: this.cdpService.getDimensions(),
+        antiDetection: {
+          enabled: resolvedAntiDetection.enabled,
+          preset: resolvedAntiDetection.preset,
+          mode: resolvedAntiDetection.mode,
+        },
       });
     }
 

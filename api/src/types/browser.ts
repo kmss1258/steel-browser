@@ -16,6 +16,63 @@ export type OptimizeBandwidthOptions = {
   blockUrlPatterns?: string[];
 };
 
+export type AntiDetectionPreset = "default" | "windows_kr";
+
+export type AntiDetectionMode = "balanced" | "strict";
+
+export interface AntiDetectionOptions {
+  enabled?: boolean;
+  preset?: AntiDetectionPreset;
+  mode?: AntiDetectionMode;
+}
+
+export interface ResolvedAntiDetection {
+  enabled: boolean;
+  preset: AntiDetectionPreset;
+  mode: AntiDetectionMode;
+  locale: string;
+  languages: string[];
+  acceptLanguage: string;
+  accept: string;
+  timezone: string;
+  navigatorPlatform: string;
+  userAgentPlatform: string;
+  vendor: string;
+  userAgent: string;
+  device: "desktop" | "mobile";
+  dimensions: {
+    width: number;
+    height: number;
+  };
+  fingerprintLocales: string[];
+  fingerprintOperatingSystems: Array<"windows" | "linux" | "macos" | "android" | "ios">;
+  navigationHeaders: {
+    accept: string;
+    acceptLanguage: string;
+    secChUa: string;
+    secChUaMobile: string;
+    secChUaPlatform: string;
+    upgradeInsecureRequests: string;
+    secFetchSite: string;
+    secFetchMode: string;
+    secFetchUser: string;
+    secFetchDest: string;
+    priority: string;
+  };
+  userAgentMetadata: {
+    brands: Array<{ brand: string; version: string }>;
+    fullVersionList: Array<{ brand: string; version: string }>;
+    fullVersion: string;
+    platform: string;
+    platformVersion: string;
+    architecture: string;
+    model: string;
+    mobile: boolean;
+    bitness: string;
+    wow64: boolean;
+  };
+}
+
 export interface BrowserLauncherOptions {
   options: BrowserServerOptions;
   req?: Request;
@@ -38,6 +95,7 @@ export interface BrowserLauncherOptions {
     width: number;
     height: number;
   } | null;
+  antiDetection?: ResolvedAntiDetection;
   userDataDir?: string;
   userPreferences?: Record<string, any>;
   extra?: Record<string, Record<string, string>>;
