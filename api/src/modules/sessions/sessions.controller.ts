@@ -215,7 +215,7 @@ export const handleGetSessionLiveDetails = async (
 
     const validPagesInfo = pagesInfo.filter((page) => page !== null);
 
-    const browserVersion = await server.cdpService.getBrowserState();
+    const browserVersion = await server.cdpService.getBrowserVersionString();
 
     const browserState = {
       status: server.sessionService.activeSession.status,

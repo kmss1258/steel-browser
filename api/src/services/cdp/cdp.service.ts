@@ -36,7 +36,13 @@ import {
   compileUrlPatterns,
   isImageRequest,
 } from "../../utils/requests.js";
-import { filterHeaders, getChromeExecutablePath, installMouseHelper } from "../../utils/browser.js";
+import {
+  filterHeaders,
+  getChromeExecutablePath,
+  installMouseHelper,
+  runPageBootstrapAction,
+  safelyReadPageUrl,
+} from "../../utils/browser.js";
 import {
   deepMerge,
   extractStorageForPage,
@@ -313,6 +319,136 @@ export class CDPService extends EventEmitter {
     }
   }
 
+  private async waitForTargetPage(
+    target: Target,
+    context: string,
+    attempts = 5,
+    delayMs = 100,
+  ): Promise<Page | null> {
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      const page = await target.page().catch((error) => {
+        this.logger.warn(
+          { err: error, attempt, context },
+          `[CDPService] Failed to resolve page from target`,
+        );
+        return null;
+      });
+
+      if (page && !page.isClosed()) {
+        if (attempt > 1) {
+          this.logger.info(
+            { attempt, context },
+            `[CDPService] Resolved target page after retry`,
+          );
+        }
+
+        return page;
+      }
+
+      if (attempt < attempts) {
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+      }
+    }
+
+    this.logger.warn({ context }, `[CDPService] Target page was not ready in time`);
+    return null;
+  }
+
+  private async runPageInitializationStep(
+    page: Page,
+    step: string,
+    fn: () => Promise<void>,
+  ): Promise<boolean> {
+    if (page.isClosed()) {
+      this.logger.warn({ step }, `[CDPService] Skipping page init step because page is closed`);
+      return false;
+    }
+
+    try {
+      await fn();
+      this.logger.debug({ step }, `[CDPService] Page init step completed`);
+      return true;
+    } catch (error) {
+      this.logger.error({ err: error, step }, `[CDPService] Page init step failed`);
+      return false;
+    }
+  }
+
+  private async applyPageHeaders(page: Page): Promise<void> {
+    if (this.launchConfig?.antiDetection?.enabled && this.launchConfig?.antiDetection?.acceptLanguage) {
+      await page.setExtraHTTPHeaders({
+        "accept-language": this.launchConfig.antiDetection.acceptLanguage,
+      });
+      return;
+    }
+
+    if (!this.launchConfig?.antiDetection?.enabled && this.launchConfig?.customHeaders) {
+      await page.setExtraHTTPHeaders({
+        ...env.DEFAULT_HEADERS,
+        ...this.launchConfig.customHeaders,
+      });
+      return;
+    }
+
+    if (!this.launchConfig?.antiDetection?.enabled && env.DEFAULT_HEADERS) {
+      await page.setExtraHTTPHeaders(env.DEFAULT_HEADERS);
+    }
+  }
+
+  private registerPageResponseGuard(page: Page): void {
+    page.on("response", (response) => {
+      if (response.url().startsWith("file://")) {
+        this.logger.error(`[CDPService] Blocked response from file protocol: ${response.url()}`);
+        page.close().catch(() => {});
+      }
+    });
+  }
+
+  private async initializeNewPageTarget(page: Page): Promise<void> {
+    await this.runPageInitializationStep(page, "plugin:onPageCreated", async () => {
+      await this.pluginManager.onPageCreated(page);
+    });
+
+    await this.runPageInitializationStep(page, "mouse-helper", async () => {
+      const installed = await installMouseHelper(
+        page,
+        this.launchConfig?.deviceConfig?.device || "desktop",
+      );
+
+      if (!installed) {
+        this.logger.warn(`[CDPService] Mouse helper was skipped for the new page target`);
+      }
+    });
+
+    await this.runPageInitializationStep(page, "headers", async () => {
+      await this.applyPageHeaders(page);
+    });
+
+    if (!env.SKIP_FINGERPRINT_INJECTION) {
+      await this.runPageInitializationStep(page, "fingerprint", async () => {
+        await this.injectFingerprintSafely(page, this.fingerprintData);
+      });
+    } else {
+      this.logger.info(
+        "[CDPService] Fingerprint injection skipped due to 'SKIP_FINGERPRINT_INJECTION' setting",
+      );
+    }
+
+    const interceptionEnabled = await this.runPageInitializationStep(
+      page,
+      "request-interception",
+      async () => {
+        await page.setRequestInterception(true);
+      },
+    );
+
+    if (interceptionEnabled) {
+      page.on("request", (request) => this.handlePageRequest(request, page));
+    }
+
+    this.registerPageResponseGuard(page);
+  }
+
   private getPreferredAcceptLanguage(): string | undefined {
     return (
       this.launchConfig?.customHeaders?.["accept-language"] ||
@@ -362,164 +498,141 @@ export class CDPService extends EventEmitter {
     }
 
     if (target.type() === TargetType.PAGE) {
-      const page = await target.page().catch((e) => {
-        this.logger.error(`Error handling new target in CDPService: ${e}`);
-        return null;
-      });
+      const page = await this.waitForTargetPage(target, "handleNewTarget");
 
-      if (page) {
-        try {
-          const url = page.url();
-          if (url && url.startsWith("http")) {
-            const origin = new URL(url).origin;
-            this.trackedOrigins.add(origin);
-            this.logger.debug(`[CDPService] Tracking new origin: ${origin}`);
-          }
-        } catch (err) {
-          this.logger.error(`[CDPService] Error tracking origin: ${err}`);
-        }
+        if (page) {
+        const safePageUrl = safelyReadPageUrl(page) ?? "about:blank";
 
-        // Notify plugins about the new page
-        await this.pluginManager.onPageCreated(page);
-
-        // Only install mouse helper in headless mode
-        if (this.launchConfig?.options?.headless) {
-          installMouseHelper(page, this.launchConfig?.deviceConfig?.device || "desktop");
-        }
-
-        if (this.launchConfig?.antiDetection?.enabled && this.launchConfig?.antiDetection?.acceptLanguage) {
-          await page.setExtraHTTPHeaders({
-            "accept-language": this.launchConfig.antiDetection.acceptLanguage,
-          });
-        } else if (!this.launchConfig?.antiDetection?.enabled && this.launchConfig?.customHeaders) {
-          await page.setExtraHTTPHeaders({
-            ...env.DEFAULT_HEADERS,
-            ...this.launchConfig.customHeaders,
-          });
-        } else if (!this.launchConfig?.antiDetection?.enabled && env.DEFAULT_HEADERS) {
-          await page.setExtraHTTPHeaders(env.DEFAULT_HEADERS);
-        }
-
-        // Inject fingerprint only if it's not skipped
-        if (!env.SKIP_FINGERPRINT_INJECTION) {
-          // Use our safer fingerprint injection method instead of FingerprintInjector
-          await this.injectFingerprintSafely(page, this.fingerprintData);
-          this.logger.debug("[CDPService] Injected fingerprint into page");
-        } else {
           this.logger.info(
-            "[CDPService] Fingerprint injection skipped due to 'SKIP_FINGERPRINT_INJECTION' setting",
+            { pageId: this.getTargetId(page), url: safePageUrl },
+            `[CDPService] Initializing new page target`,
           );
-        }
 
-        await page.setRequestInterception(true);
-
-        page.on("request", (request) => this.handlePageRequest(request, page));
-
-        page.on("response", (response) => {
-          if (response.url().startsWith("file://")) {
-            this.logger.error(
-              `[CDPService] Blocked response from file protocol: ${response.url()}`,
-            );
-            page.close().catch(() => {});
-            this.shutdown();
+          try {
+            if (safePageUrl.startsWith("http")) {
+              const origin = new URL(safePageUrl).origin;
+              this.trackedOrigins.add(origin);
+              this.logger.debug(`[CDPService] Tracking new origin: ${origin}`);
+            }
+          } catch (err) {
+            this.logger.error(`[CDPService] Error tracking origin: ${err}`);
           }
-        });
+
+          try {
+            await this.initializeNewPageTarget(page);
+          } catch (error) {
+            this.logger.error({ err: error }, `[CDPService] New page target initialization crashed unexpectedly`);
+          }
+        }
+      } else if (target.type() === TargetType.BACKGROUND_PAGE) {
+        this.logger.info(`[CDPService] Background page created: ${target.url()}`);
       }
-    } else if (target.type() === TargetType.BACKGROUND_PAGE) {
-      this.logger.info(`[CDPService] Background page created: ${target.url()}`);
-    }
-  }
-
-  private async handlePageRequest(request: HTTPRequest, page: Page) {
-    const url = request.url();
-    const headers = request.headers();
-    const antiDetection = this.launchConfig?.antiDetection;
-    const preferredAcceptLanguage = this.getPreferredAcceptLanguage();
-    if (!headers["accept-language"] && preferredAcceptLanguage) {
-      headers["accept-language"] = preferredAcceptLanguage;
     }
 
-    const parsed = tryParseUrl(url);
+    private async handlePageRequest(request: HTTPRequest, page: Page) {
+      const url = request.url();
+      const headers = request.headers();
+      const antiDetection = this.launchConfig?.antiDetection;
+      const preferredAcceptLanguage = this.getPreferredAcceptLanguage();
+      if (!headers["accept-language"] && preferredAcceptLanguage) {
+        headers["accept-language"] = preferredAcceptLanguage;
+      }
 
-    const optimize = this.launchConfig?.optimizeBandwidth;
-    const isOptimizeObject = typeof optimize === "object";
-    const blockedHosts = isOptimizeObject ? optimize.blockHosts : undefined;
+      const parsed = tryParseUrl(url);
 
-    if (parsed && this.launchConfig?.blockAds && isAdRequest(parsed)) {
-      this.logger.info(`[CDPService] Blocked request to ad related resource: ${url}`);
-      await request.abort();
-      return;
-    }
+      const optimize = this.launchConfig?.optimizeBandwidth;
+      const isOptimizeObject = typeof optimize === "object";
+      const blockedHosts = isOptimizeObject ? optimize.blockHosts : undefined;
 
-    if (
-      (parsed && isHostBlocked(parsed, blockedHosts)) ||
-      isUrlMatchingPatterns(url, this.compiledUrlPatterns)
-    ) {
-      this.logger.info(`[CDPService] Blocked request to blocked host or pattern: ${url}`);
-      await request.abort();
-      return;
-    }
-
-    // Block resources via optimizeBandwidth
-    const blockImages = isOptimizeObject ? !!optimize.blockImages : false;
-    const blockMedia = isOptimizeObject ? !!optimize.blockMedia : false;
-    const blockStylesheets = isOptimizeObject ? !!optimize.blockStylesheets : false;
-
-    if (parsed && (blockImages || blockMedia || blockStylesheets)) {
-      const resourceType = request.resourceType();
-      if (
-        (blockImages && (resourceType === "image" || isImageRequest(parsed))) ||
-        (blockMedia && (resourceType === "media" || isHeavyMediaRequest(parsed))) ||
-        (blockStylesheets && resourceType === "stylesheet")
-      ) {
-        this.logger.info(
-          `[CDPService] Blocked ${resourceType} resource due to optimizeBandwidth (${
-            blockImages ? "blockImages" : ""
-          }${blockMedia ? "blockMedia" : ""}${blockStylesheets ? "blockStylesheets" : ""}): ${url}`,
-        );
+      if (parsed && this.launchConfig?.blockAds && isAdRequest(parsed)) {
+        this.logger.info(`[CDPService] Blocked request to ad related resource: ${url}`);
         await request.abort();
         return;
       }
+
+      if (
+        (parsed && isHostBlocked(parsed, blockedHosts)) ||
+        isUrlMatchingPatterns(url, this.compiledUrlPatterns)
+      ) {
+        this.logger.info(`[CDPService] Blocked request to blocked host or pattern: ${url}`);
+        await request.abort();
+        return;
+      }
+
+      // Block resources via optimizeBandwidth
+      const blockImages = isOptimizeObject ? !!optimize.blockImages : false;
+      const blockMedia = isOptimizeObject ? !!optimize.blockMedia : false;
+      const blockStylesheets = isOptimizeObject ? !!optimize.blockStylesheets : false;
+
+      if (parsed && (blockImages || blockMedia || blockStylesheets)) {
+        const resourceType = request.resourceType();
+        if (
+          (blockImages && (resourceType === "image" || isImageRequest(parsed))) ||
+          (blockMedia && (resourceType === "media" || isHeavyMediaRequest(parsed))) ||
+          (blockStylesheets && resourceType === "stylesheet")
+        ) {
+          this.logger.info(
+            `[CDPService] Blocked ${resourceType} resource due to optimizeBandwidth (${
+              blockImages ? "blockImages" : ""
+            }${blockMedia ? "blockMedia" : ""}${blockStylesheets ? "blockStylesheets" : ""}): ${url}`,
+          );
+          await request.abort();
+          return;
+        }
+      }
+
+      if (antiDetection?.enabled && request.resourceType() === "document") {
+        const navigationHeaders = antiDetection.navigationHeaders;
+        const orderedHeaders = this.buildOrderedHeaders(
+          headers,
+          {
+            accept: navigationHeaders.accept,
+            "sec-ch-ua": navigationHeaders.secChUa,
+            "sec-ch-ua-mobile": navigationHeaders.secChUaMobile,
+            "sec-ch-ua-platform": navigationHeaders.secChUaPlatform,
+            "upgrade-insecure-requests": navigationHeaders.upgradeInsecureRequests,
+          },
+          [
+            "sec-ch-ua",
+            "sec-ch-ua-mobile",
+            "sec-ch-ua-platform",
+            "upgrade-insecure-requests",
+            "user-agent",
+            "accept",
+            "sec-fetch-site",
+            "sec-fetch-mode",
+            "sec-fetch-user",
+            "sec-fetch-dest",
+            "referer",
+            "accept-encoding",
+            "accept-language",
+          ],
+        );
+
+        await request.continue({ headers: orderedHeaders });
+        return;
+      }
+
+      if (url.startsWith("file://")) {
+        this.logger.error(`[CDPService] Blocked request to file protocol: ${url}`);
+        page.close().catch(() => {});
+        await request.abort().catch(() => {});
+        return;
+      } else {
+        await request.continue({ headers });
+      }
     }
 
-    if (antiDetection?.enabled && request.resourceType() === "document") {
-      const navigationHeaders = antiDetection.navigationHeaders;
-      const orderedHeaders = this.buildOrderedHeaders(
-        headers,
-        {
-          accept: navigationHeaders.accept,
-          "sec-ch-ua": navigationHeaders.secChUa,
-          "sec-ch-ua-mobile": navigationHeaders.secChUaMobile,
-          "sec-ch-ua-platform": navigationHeaders.secChUaPlatform,
-          "upgrade-insecure-requests": navigationHeaders.upgradeInsecureRequests,
-        },
-        [
-          "sec-ch-ua",
-          "sec-ch-ua-mobile",
-          "sec-ch-ua-platform",
-          "upgrade-insecure-requests",
-          "user-agent",
-          "accept",
-          "sec-fetch-site",
-          "sec-fetch-mode",
-          "sec-fetch-user",
-          "sec-fetch-dest",
-          "referer",
-          "accept-encoding",
-          "accept-language",
-        ],
-      );
-
-      await request.continue({ headers: orderedHeaders });
-      return;
+  public async getBrowserVersionString(): Promise<string> {
+    if (!this.browserInstance) {
+      return "unknown";
     }
 
-    if (url.startsWith("file://")) {
-      this.logger.error(`[CDPService] Blocked request to file protocol: ${url}`);
-      page.close().catch(() => {});
-      this.shutdown();
-    } else {
-      await request.continue({ headers });
+    try {
+      return await this.browserInstance.version();
+    } catch (error) {
+      this.logger.warn({ err: error }, `[CDPService] Failed to read browser version string`);
+      return "unknown";
     }
   }
 
@@ -1553,32 +1666,38 @@ export class CDPService extends EventEmitter {
 
       await this.injectAutomationHardening(page, fingerprintData);
 
-      await page.evaluateOnNewDocument(
-        loadFingerprintScript({
-          fixedPlatform:
-            antiDetection?.navigatorPlatform || fingerprint.navigator.platform || "Linux x86_64",
-          fixedVendor: (fingerprint.videoCard as VideoCard | null)?.vendor,
-          fixedRenderer: (fingerprint.videoCard as VideoCard | null)?.renderer,
-          fixedDeviceMemory: fingerprint.navigator.deviceMemory || 8,
-          fixedHardwareConcurrency: fingerprint.navigator.hardwareConcurrency || 8,
-          fixedArchitecture:
-            antiDetection?.userAgentMetadata.architecture || userAgentMetadata.architecture || "x86",
-          fixedBitness:
-            antiDetection?.userAgentMetadata.bitness || userAgentMetadata.bitness || "64",
-          fixedModel: antiDetection?.userAgentMetadata.model || userAgentMetadata.model || "",
-          fixedPlatformVersion:
-            antiDetection?.userAgentMetadata.platformVersion || userAgentMetadata.platformVersion || "10.0.0",
-          fixedUaFullVersion:
-            antiDetection?.userAgentMetadata.fullVersion || userAgentMetadata.uaFullVersion || "145.0.0.0",
-          fixedBrands:
-            antiDetection?.userAgentMetadata.brands ||
-            userAgentMetadata.brands ||
-            ([] as unknown as Array<{
-              brand: string;
-              version: string;
-            }>),
-        }),
+      const fingerprintScriptInstalled = await runPageBootstrapAction(page, async () =>
+        page.evaluateOnNewDocument(
+          loadFingerprintScript({
+            fixedPlatform:
+              antiDetection?.navigatorPlatform || fingerprint.navigator.platform || "Linux x86_64",
+            fixedVendor: (fingerprint.videoCard as VideoCard | null)?.vendor,
+            fixedRenderer: (fingerprint.videoCard as VideoCard | null)?.renderer,
+            fixedDeviceMemory: fingerprint.navigator.deviceMemory || 8,
+            fixedHardwareConcurrency: fingerprint.navigator.hardwareConcurrency || 8,
+            fixedArchitecture:
+              antiDetection?.userAgentMetadata.architecture || userAgentMetadata.architecture || "x86",
+            fixedBitness:
+              antiDetection?.userAgentMetadata.bitness || userAgentMetadata.bitness || "64",
+            fixedModel: antiDetection?.userAgentMetadata.model || userAgentMetadata.model || "",
+            fixedPlatformVersion:
+              antiDetection?.userAgentMetadata.platformVersion || userAgentMetadata.platformVersion || "10.0.0",
+            fixedUaFullVersion:
+              antiDetection?.userAgentMetadata.fullVersion || userAgentMetadata.uaFullVersion || "145.0.0.0",
+            fixedBrands:
+              antiDetection?.userAgentMetadata.brands ||
+              userAgentMetadata.brands ||
+              ([] as unknown as Array<{
+                brand: string;
+                version: string;
+              }>),
+          }),
+        ),
       );
+
+      if (!fingerprintScriptInstalled) {
+        throw new Error("Fingerprint bootstrap script could not be installed before the page became ready.");
+      }
     } catch (error) {
       this.logger.error({ error }, `[Fingerprint] Error injecting fingerprint safely`);
       const fingerprintInjector = new FingerprintInjector();
@@ -1610,8 +1729,9 @@ export class CDPService extends EventEmitter {
       "WebKit built-in PDF",
     ];
 
-    await page.evaluateOnNewDocument(
-      ({ languages, platform, vendor, hardwareConcurrency, deviceMemory, pluginNames, brands, fullVersion }) => {
+    const hardeningInstalled = await runPageBootstrapAction(page, async () =>
+      page.evaluateOnNewDocument(
+        ({ languages, platform, vendor, hardwareConcurrency, deviceMemory, pluginNames, brands, fullVersion }) => {
         const defineValue = (target: object, key: string, value: unknown) => {
           try {
             Object.defineProperty(target, key, {
@@ -1752,7 +1872,7 @@ export class CDPService extends EventEmitter {
             return originalQuery(parameters);
           };
         }
-      },
+        },
         {
           languages,
           platform: antiDetection?.navigatorPlatform || navigatorData?.platform || "Win32",
@@ -1768,7 +1888,12 @@ export class CDPService extends EventEmitter {
             fingerprint?.navigator.userAgentData?.uaFullVersion ||
             "145.0.0.0",
         },
-      );
+      ),
+    );
+
+    if (!hardeningInstalled) {
+      this.logger.warn(`[AutomationHardening] Skipped because the page main frame was not ready in time`);
+    }
   }
 
   @traceable

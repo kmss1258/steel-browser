@@ -49,7 +49,15 @@ export async function attachPageEvents(
     timestamp: new Date().toISOString(),
     pageId,
     targetType,
-    navigation: { url: page.url() },
+    navigation: {
+      url: (() => {
+        try {
+          return page.url();
+        } catch {
+          return "about:blank";
+        }
+      })(),
+    },
   });
 
   // Track request metadata by requestId for use in loadingFailed (url) and loadingFinished (mimeType)

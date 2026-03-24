@@ -8,6 +8,17 @@ log() {
     fi
 }
 
+is_headless() {
+    case "${CHROME_HEADLESS:-true}" in
+        true|1|TRUE|True|yes|YES)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
 # Initialize DBus
 init_dbus() {
     log "Initializing DBus..."
@@ -62,6 +73,63 @@ verify_chrome() {
     return 0
 }
 
+start_virtual_display() {
+    if is_headless; then
+        log "Skipping Xvfb startup in headless mode"
+        return 0
+    fi
+
+    display_value="${DISPLAY:-:10}"
+    export DISPLAY="$display_value"
+    display_number="${DISPLAY#:}"
+    display_number="${display_number%%.*}"
+    x_lock_file="/tmp/.X${display_number}-lock"
+    x_socket_file="/tmp/.X11-unix/X${display_number}"
+
+    if xset -display "$DISPLAY" q >/dev/null 2>&1; then
+        log "Using existing X display at $DISPLAY"
+        return 0
+    fi
+
+    if [ -f "$x_lock_file" ] || [ -S "$x_socket_file" ]; then
+        log "Removing stale X server artifacts for $DISPLAY"
+        rm -f "$x_lock_file"
+        rm -f "$x_socket_file"
+    fi
+
+    if ! command -v Xvfb >/dev/null 2>&1; then
+        echo "ERROR: Xvfb is required for headful Chrome but is not installed" >&2
+        return 1
+    fi
+
+    log "Starting Xvfb on $DISPLAY"
+    Xvfb "$DISPLAY" -screen 0 1920x1080x24 -ac +extension RANDR >/tmp/xvfb.log 2>&1 &
+    XVFB_PID=$!
+    export XVFB_PID
+
+    attempt=1
+    max_attempts=20
+    while [ $attempt -le $max_attempts ]; do
+        if xset -display "$DISPLAY" q >/dev/null 2>&1; then
+            log "Xvfb is ready on $DISPLAY"
+            return 0
+        fi
+
+        if ! kill -0 "$XVFB_PID" >/dev/null 2>&1; then
+            echo "ERROR: Xvfb exited before becoming ready" >&2
+            cat /tmp/xvfb.log >&2 || true
+            return 1
+        fi
+
+        sleep 0.5
+        attempt=$((attempt + 1))
+    done
+
+    echo "ERROR: Timed out waiting for Xvfb on $DISPLAY" >&2
+    cat /tmp/xvfb.log >&2 || true
+    return 1
+}
+
 # Start nginx with better error handling
 start_nginx() {
     if [ "$START_NGINX" = "true" ]; then
@@ -99,7 +167,7 @@ main() {
         fi
     done
     
-    if [ "$DEBUG" = "true" ]; then
+    if [ "$DEBUG" = "true" ] || ! is_headless; then
         init_dbus || exit 1
         verify_chrome || exit 1
     fi
@@ -107,13 +175,16 @@ main() {
     
     # Set required environment variables
     export CDP_REDIRECT_PORT=9223
-    export DISPLAY=:10
+    export DISPLAY="${DISPLAY:-:10}"
+    start_virtual_display || exit 1
     
     # Log environment state
     log "Environment configuration:"
     log "HOST=$HOST"
     log "CDP_REDIRECT_PORT=$CDP_REDIRECT_PORT"
     log "NODE_ENV=$NODE_ENV"
+    log "CHROME_HEADLESS=${CHROME_HEADLESS:-true}"
+    log "DISPLAY=$DISPLAY"
     
     # Start the application
     # Run the `npm run start` command but without npm.

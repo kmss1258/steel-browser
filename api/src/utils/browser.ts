@@ -3,6 +3,9 @@ import path from "path";
 import { Page } from "puppeteer-core";
 import { env } from "../env.js";
 
+const RETRYABLE_PAGE_BOOTSTRAP_PATTERN =
+  /Requesting main frame too early|main frame|Target closed|Session closed|Execution context was destroyed/i;
+
 export const getChromeExecutablePath = () => {
   if (env.CHROME_EXECUTABLE_PATH) {
     const executablePath = env.CHROME_EXECUTABLE_PATH;
@@ -33,12 +36,29 @@ export const getChromeExecutablePath = () => {
 };
 
 export async function installMouseHelper(page: Page, device: string) {
-  await page.evaluateOnNewDocument((deviceType) => {
-    // Install mouse helper only for top-level frame.
-    if (window !== window.parent) return;
-    window.addEventListener(
-      "DOMContentLoaded",
-      () => {
+  if (page.isClosed()) {
+    return false;
+  }
+
+  const installScript = async () => {
+    await page.evaluateOnNewDocument((deviceType) => {
+      // Install mouse helper only for top-level frame.
+      if (window !== window.parent) return;
+
+      const runWhenDomReady = (fn: () => void) => {
+        if (document.readyState === "loading") {
+          document.addEventListener("DOMContentLoaded", fn, { once: true });
+          return;
+        }
+
+        fn();
+      };
+
+      runWhenDomReady(() => {
+        if (!document.body) {
+          return;
+        }
+
         if (deviceType === "desktop") {
           // Desktop mode: show regular arrow cursor
           const CURSOR_ID = "__cursor__";
@@ -66,6 +86,10 @@ export async function installMouseHelper(page: Page, device: string) {
             cursor.style.left = e.clientX + "px";
           });
         } else {
+          if (!document.head) {
+            return;
+          }
+
           // Mobile mode: show circular touch indicator
           const box = document.createElement("puppeteer-mouse-pointer");
           const styleElement = document.createElement("style");
@@ -139,10 +163,48 @@ export async function installMouseHelper(page: Page, device: string) {
               box.classList.toggle("button-" + i, buttons & (1 << i));
           }
         }
-      },
-      false,
-    );
-  }, device);
+      });
+    }, device);
+  };
+
+  return runPageBootstrapAction(page, installScript);
+}
+
+export async function runPageBootstrapAction<T>(
+  page: Page,
+  action: () => Promise<T>,
+  options: { attempts?: number; delayMs?: number } = {},
+): Promise<T | false> {
+  const attempts = options.attempts ?? 5;
+  const delayMs = options.delayMs ?? 100;
+
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    if (page.isClosed()) {
+      return false;
+    }
+
+    try {
+      return await action();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+
+      if (!RETRYABLE_PAGE_BOOTSTRAP_PATTERN.test(message) || attempt === attempts) {
+        return false;
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+
+  return false;
+}
+
+export function safelyReadPageUrl(page: Page): string | null {
+  try {
+    return page.url();
+  } catch {
+    return null;
+  }
 }
 
 export function filterHeaders(headers: Record<string, string>) {

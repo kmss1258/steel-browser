@@ -13,6 +13,7 @@ const INTERNAL_EXTENSIONS = new Set<string>([
 
 export class TargetInstrumentationManager {
   private attachedSessions = new Set<string>();
+  private attachingSessions = new Map<string, Promise<void>>();
   private cdpSessions = new Map<string, CDPSession>();
 
   private pageEventsOptions: AttachPageEventsOptions;
@@ -25,6 +26,41 @@ export class TargetInstrumentationManager {
     this.pageEventsOptions = pageEventsOptions ?? {};
   }
 
+  private async waitForTargetPage(
+    target: Target,
+    sessionId: string,
+    attempts = 5,
+    delayMs = 100,
+  ) {
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      const page = await target.page().catch((err) => {
+        this.appLogger.warn(
+          { err, sessionId, attempt },
+          `[TargetManager] Failed to resolve page from target`,
+        );
+        return null;
+      });
+
+      if (page && !page.isClosed()) {
+        if (attempt > 1) {
+          this.appLogger.info(
+            { sessionId, attempt },
+            `[TargetManager] Resolved target page after retry`,
+          );
+        }
+
+        return page;
+      }
+
+      if (attempt < attempts) {
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+      }
+    }
+
+    this.appLogger.warn({ sessionId }, `[TargetManager] Target page was not ready in time`);
+    return null;
+  }
+
   async attach(target: Target, type: TargetType) {
     const url = target.url?.() ?? "";
     const isExtensionTarget = url.startsWith("chrome-extension://");
@@ -34,84 +70,87 @@ export class TargetInstrumentationManager {
       return;
     }
 
-    this.attachedSessions.add(sessionId);
+    const inFlightAttach = this.attachingSessions.get(sessionId);
+    if (inFlightAttach) {
+      await inFlightAttach;
+      return;
+    }
 
-    switch (type) {
-      case TargetType.PAGE:
-      case TargetType.BACKGROUND_PAGE: {
-        // Create a single CDP session shared by page-events and cdp-events
-        const session = await target.createCDPSession();
-        this.cdpSessions.set(sessionId, session);
-        await this.enableDomainsForTarget(session, type, isExtensionTarget);
+    const attachPromise = this.attachInternal(target, type, sessionId, isExtensionTarget)
+      .catch((err) => {
+        this.appLogger.warn({ err, sessionId, type }, `[TargetManager] Target attach failed`);
+      })
+      .finally(() => {
+        if (this.attachingSessions.get(sessionId) === attachPromise) {
+          this.attachingSessions.delete(sessionId);
+        }
+      });
 
-        const page = await target.page();
-        if (page) {
-          await attachPageEvents(page, session, this.logger, type, this.pageEventsOptions);
+    this.attachingSessions.set(sessionId, attachPromise);
+    await attachPromise;
+  }
+
+  private async attachInternal(
+    target: Target,
+    type: TargetType,
+    sessionId: string,
+    isExtensionTarget: boolean,
+  ) {
+    let session: CDPSession | null = null;
+
+    try {
+      session = await target.createCDPSession();
+      this.cdpSessions.set(sessionId, session);
+      await this.enableDomainsForTarget(session, type, isExtensionTarget);
+
+      switch (type) {
+        case TargetType.PAGE:
+        case TargetType.BACKGROUND_PAGE: {
+          const page = await this.waitForTargetPage(target, sessionId);
+          if (page) {
+            await attachPageEvents(page, session, this.logger, type, this.pageEventsOptions);
+          }
+
+          attachCDPEvents(session, this.logger);
+
+          if (isExtensionTarget) {
+            await attachExtensionEvents(target, this.logger, INTERNAL_EXTENSIONS, this.appLogger);
+          }
+          break;
         }
 
-        attachCDPEvents(session, this.logger);
+        case TargetType.SERVICE_WORKER:
+        case TargetType.SHARED_WORKER:
+        case TargetType.WEBVIEW: {
+          attachCDPEvents(session, this.logger);
 
-        if (isExtensionTarget) {
-          await attachExtensionEvents(target, this.logger, INTERNAL_EXTENSIONS, this.appLogger);
+          if (isExtensionTarget) {
+            await attachExtensionEvents(target, this.logger, INTERNAL_EXTENSIONS, this.appLogger);
+          } else {
+            attachWorkerEvents(target, session, this.logger, type);
+          }
+          break;
         }
-        break;
+
+        case TargetType.BROWSER:
+        case TargetType.OTHER:
+        default: {
+          attachCDPEvents(session, this.logger);
+
+          if (isExtensionTarget) {
+            await attachExtensionEvents(target, this.logger, INTERNAL_EXTENSIONS, this.appLogger);
+          }
+          break;
+        }
       }
 
-      case TargetType.SERVICE_WORKER: {
-        const session = await target.createCDPSession();
-        this.cdpSessions.set(sessionId, session);
-        await this.enableDomainsForTarget(session, type, isExtensionTarget);
-        attachCDPEvents(session, this.logger);
-
-        if (isExtensionTarget) {
-          await attachExtensionEvents(target, this.logger, INTERNAL_EXTENSIONS, this.appLogger);
-        } else {
-          attachWorkerEvents(target, session, this.logger, type);
-        }
-        break;
+      this.attachedSessions.add(sessionId);
+    } catch (err) {
+      this.cdpSessions.delete(sessionId);
+      if (session) {
+        session.detach().catch(() => {});
       }
-
-      case TargetType.SHARED_WORKER: {
-        const session = await target.createCDPSession();
-        this.cdpSessions.set(sessionId, session);
-        await this.enableDomainsForTarget(session, type, isExtensionTarget);
-        attachCDPEvents(session, this.logger);
-
-        if (isExtensionTarget) {
-          await attachExtensionEvents(target, this.logger, INTERNAL_EXTENSIONS, this.appLogger);
-        } else {
-          attachWorkerEvents(target, session, this.logger, type);
-        }
-        break;
-      }
-
-      case TargetType.WEBVIEW: {
-        const session = await target.createCDPSession();
-        this.cdpSessions.set(sessionId, session);
-        await this.enableDomainsForTarget(session, type, isExtensionTarget);
-        attachCDPEvents(session, this.logger);
-
-        if (isExtensionTarget) {
-          await attachExtensionEvents(target, this.logger, INTERNAL_EXTENSIONS, this.appLogger);
-        } else {
-          attachWorkerEvents(target, session, this.logger, type);
-        }
-        break;
-      }
-
-      case TargetType.BROWSER:
-      case TargetType.OTHER:
-      default: {
-        const session = await target.createCDPSession();
-        this.cdpSessions.set(sessionId, session);
-        await this.enableDomainsForTarget(session, type, isExtensionTarget);
-        attachCDPEvents(session, this.logger);
-
-        if (isExtensionTarget) {
-          await attachExtensionEvents(target, this.logger, INTERNAL_EXTENSIONS, this.appLogger);
-        }
-        break;
-      }
+      throw err;
     }
   }
 
