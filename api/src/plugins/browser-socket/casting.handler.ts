@@ -1,5 +1,5 @@
 import { IncomingMessage } from "http";
-import puppeteer, { Browser, CDPSession, Page } from "puppeteer-core";
+import puppeteer, { Browser, CDPSession, Frame, Page } from "puppeteer-core";
 import { Duplex } from "stream";
 import WebSocket, { Server } from "ws";
 
@@ -90,6 +90,7 @@ export async function handleCastSession(
     let hasReceivedFirstFrame = false;
     let cachedPageTitle: string | null = null;
     let cachedPageFavicon: string | null = null;
+    let navigationMetadataListener: ((frame: Frame) => void | Promise<void>) | null = null;
 
     const activePages = new Map<string, Page>();
 
@@ -112,7 +113,10 @@ export async function handleCastSession(
       }
 
       if (targetPage) {
-        targetPage.removeAllListeners("framenavigated");
+        if (navigationMetadataListener) {
+          targetPage.off("framenavigated", navigationMetadataListener);
+          navigationMetadataListener = null;
+        }
       }
 
       // Clean up screencast
@@ -315,7 +319,7 @@ export async function handleCastSession(
         cachedPageTitle = await getPageTitle(targetPage);
         cachedPageFavicon = await getPageFavicon(targetPage);
 
-        targetPage.on("framenavigated", async (frame) => {
+        navigationMetadataListener = async (frame: Frame) => {
           if (!targetPage || frame !== targetPage.mainFrame()) {
             return;
           }
@@ -326,7 +330,9 @@ export async function handleCastSession(
           } catch (error) {
             console.error(`Error refreshing page metadata for ${targetPageId}:`, error);
           }
-        });
+        };
+
+        targetPage.on("framenavigated", navigationMetadataListener);
 
         // Setup screencast for the target page
         targetClient = await targetPage.target().createCDPSession();
@@ -444,17 +450,6 @@ export async function handleCastSession(
           } catch (err) {
             console.error("Error handling WebSocket message:", err);
           }
-        });
-
-        // Setup device metrics and start screencast
-        await targetClient.send("Page.setDeviceMetricsOverride", {
-          screenHeight: height,
-          screenWidth: width,
-          width,
-          height,
-          mobile: false,
-          screenOrientation: { angle: 90, type: "landscapePrimary" },
-          deviceScaleFactor: 1,
         });
 
         const captureFrame = async () => {
