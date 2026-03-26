@@ -17,6 +17,42 @@ import { getPageFavicon, getPageTitle, navigatePage } from "../../utils/casting.
 
 const FIRST_FRAME_TIMEOUT_MS = 4000;
 const CAPTURE_INTERVAL_MS = 250;
+const RETRYABLE_CAPTURE_BACKOFF_MS = 150;
+const POST_NAVIGATION_RECOVERY_WINDOW_MS = 5000;
+const MAX_CONSECUTIVE_RETRYABLE_FAILURES = 30;
+const MAX_REATTACH_ATTEMPTS = 3;
+
+type CastStreamPhase = "warming" | "live" | "degraded";
+
+export function isRetryableCastCaptureError(message: string): boolean {
+  const normalized = message.toLowerCase();
+
+  return [
+    "target closed",
+    "session closed",
+    "execution context was destroyed",
+    "cannot find context with specified id",
+    "inspected target navigated or closed",
+    "main frame",
+    "not attached to an active page",
+    "frame was detached",
+    "captureScreenshot timed out",
+    "timed out",
+    "tab target session is not defined",
+  ].some((candidate) => normalized.includes(candidate));
+}
+
+function shouldAttemptTargetReattach(message: string): boolean {
+  const normalized = message.toLowerCase();
+
+  return (
+    normalized.includes("target closed") ||
+    normalized.includes("session closed") ||
+    normalized.includes("execution context was destroyed") ||
+    normalized.includes("frame was detached") ||
+    normalized.includes("tab target session is not defined")
+  );
+}
 
 async function getBrowserWsEndpoint() {
   const response = await fetch(`http://127.0.0.1:${env.CDP_REDIRECT_PORT}/json/version`);
@@ -75,11 +111,6 @@ export async function handleCastSession(
   const tabDiscoveryMode =
     queryParams.get("tabInfo") === "true" || (!requestedPageId && !requestedPageIndex);
 
-  const { height, width } = (session.dimensions as { width: number; height: number }) ?? {
-    width: 1920,
-    height: 1080,
-  };
-
   wss.handleUpgrade(request, socket, head, async (ws) => {
     let browser: Browser | null = null;
     let targetPage: Page | null = null;
@@ -91,12 +122,24 @@ export async function handleCastSession(
     let cachedPageTitle: string | null = null;
     let cachedPageFavicon: string | null = null;
     let navigationMetadataListener: ((frame: Frame) => void | Promise<void>) | null = null;
+    let cleanupStarted = false;
+    let streamPhase: CastStreamPhase = "warming";
+    const openedAt = Date.now();
+    let lastNavigationAt = openedAt;
+    let consecutiveRetryableFailures = 0;
+    let reattachAttempts = 0;
 
     const activePages = new Map<string, Page>();
 
     let heartbeatInterval: NodeJS.Timeout | null = null;
 
     const handleSessionCleanup = () => {
+      if (cleanupStarted) {
+        return;
+      }
+
+      cleanupStarted = true;
+
       if (heartbeatInterval) {
         clearInterval(heartbeatInterval);
         heartbeatInterval = null;
@@ -157,6 +200,29 @@ export async function handleCastSession(
       }
     };
 
+    const attachNavigationMetadataListener = (page: Page) => {
+      if (targetPage && navigationMetadataListener) {
+        targetPage.off("framenavigated", navigationMetadataListener);
+      }
+
+      navigationMetadataListener = async (frame: Frame) => {
+        if (!targetPage || frame !== targetPage.mainFrame()) {
+          return;
+        }
+
+        lastNavigationAt = Date.now();
+
+        try {
+          cachedPageTitle = await getPageTitle(targetPage);
+          cachedPageFavicon = await getPageFavicon(targetPage);
+        } catch (error) {
+          console.error(`Error refreshing page metadata for ${targetPageId}:`, error);
+        }
+      };
+
+      page.on("framenavigated", navigationMetadataListener);
+    };
+
     const sendTabList = async () => {
       try {
         if (ws.readyState !== WebSocket.OPEN || !tabDiscoveryMode) return;
@@ -212,6 +278,159 @@ export async function handleCastSession(
       }
 
       return null;
+    };
+
+    const scheduleNextCapture = (delayMs = CAPTURE_INTERVAL_MS) => {
+      if (captureIntervalTimeout) {
+        clearTimeout(captureIntervalTimeout);
+      }
+
+      captureIntervalTimeout = setTimeout(() => {
+        void captureFrame();
+      }, delayMs);
+    };
+
+    const reattachTargetSession = async () => {
+      if (!browser) {
+        return false;
+      }
+
+      if (targetClient) {
+        try {
+          await targetClient.detach().catch(() => undefined);
+        } catch {
+        }
+
+        targetClient = null;
+      }
+
+      const pages = await browser.pages();
+      const targetResult = await findTargetPage(pages);
+
+      if (!targetResult) {
+        return false;
+      }
+
+      targetPage = targetResult.page;
+      targetPageId = targetResult.pageId;
+      cachedPageTitle = await getPageTitle(targetPage);
+      cachedPageFavicon = await getPageFavicon(targetPage);
+      attachNavigationMetadataListener(targetPage);
+      targetClient = await targetPage.target().createCDPSession();
+
+      return true;
+    };
+
+    const closeStreamWithError = (payload: { type: "castTimeout" | "castError" | "targetClosed"; pageId: string | null; error?: string }) => {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify(payload));
+      }
+
+      handleSessionCleanup();
+      ws.close();
+    };
+
+    const captureFrame = async () => {
+      if (!targetClient || !targetPage || ws.readyState !== WebSocket.OPEN || cleanupStarted) {
+        return;
+      }
+
+      try {
+        const screenshot = (await targetClient.send("Page.captureScreenshot", {
+          format: "jpeg",
+          quality: 75,
+          fromSurface: true,
+        })) as { data?: string };
+
+        if (!screenshot.data) {
+          throw new Error("Screenshot payload was empty.");
+        }
+
+        if (streamPhase === "degraded") {
+          console.warn(
+            `Cast stream recovered for pageId=${targetPageId} after ${consecutiveRetryableFailures} retryable failure(s).`,
+          );
+        }
+
+        hasReceivedFirstFrame = true;
+        if (firstFrameTimeout) {
+          clearTimeout(firstFrameTimeout);
+          firstFrameTimeout = null;
+        }
+
+        streamPhase = "live";
+        consecutiveRetryableFailures = 0;
+        reattachAttempts = 0;
+        ws.send(
+          JSON.stringify({
+            pageId: targetPageId,
+            url: targetPage.url(),
+            title: cachedPageTitle,
+            favicon: cachedPageFavicon,
+            data: screenshot.data,
+          }),
+        );
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        const retryable = isRetryableCastCaptureError(message);
+        const inRecoveryWindow = !hasReceivedFirstFrame || Date.now() - lastNavigationAt <= POST_NAVIGATION_RECOVERY_WINDOW_MS;
+
+        if (retryable) {
+          consecutiveRetryableFailures += 1;
+
+          if (streamPhase !== "degraded") {
+            console.warn(`Cast stream degraded for pageId=${targetPageId}: ${message}`);
+          }
+
+          streamPhase = "degraded";
+
+          if (
+            shouldAttemptTargetReattach(message) &&
+            reattachAttempts < MAX_REATTACH_ATTEMPTS
+          ) {
+            reattachAttempts += 1;
+
+            try {
+              const reattached = await reattachTargetSession();
+
+              if (reattached) {
+                consecutiveRetryableFailures = 0;
+                scheduleNextCapture(RETRYABLE_CAPTURE_BACKOFF_MS);
+                return;
+              }
+            } catch (reattachError) {
+              console.error(`Failed to reattach cast target for pageId=${targetPageId}:`, reattachError);
+            }
+          }
+
+          if (inRecoveryWindow || consecutiveRetryableFailures < MAX_CONSECUTIVE_RETRYABLE_FAILURES) {
+            scheduleNextCapture(RETRYABLE_CAPTURE_BACKOFF_MS);
+            return;
+          }
+        }
+
+        if (!retryable && ws.readyState === WebSocket.OPEN) {
+          console.error(`Error capturing screenshot for pageId=${targetPageId}:`, error);
+        }
+
+        if (!hasReceivedFirstFrame) {
+          closeStreamWithError({
+            type: "castTimeout",
+            pageId: targetPageId,
+            error: retryable ? "Timed out waiting for the first screencast frame." : message,
+          });
+          return;
+        }
+
+        closeStreamWithError({
+          type: "castError",
+          pageId: targetPageId,
+          error: message,
+        });
+        return;
+      }
+
+      scheduleNextCapture(CAPTURE_INTERVAL_MS);
     };
 
     try {
@@ -318,21 +537,7 @@ export async function handleCastSession(
         targetPageId = targetResult.pageId;
         cachedPageTitle = await getPageTitle(targetPage);
         cachedPageFavicon = await getPageFavicon(targetPage);
-
-        navigationMetadataListener = async (frame: Frame) => {
-          if (!targetPage || frame !== targetPage.mainFrame()) {
-            return;
-          }
-
-          try {
-            cachedPageTitle = await getPageTitle(targetPage);
-            cachedPageFavicon = await getPageFavicon(targetPage);
-          } catch (error) {
-            console.error(`Error refreshing page metadata for ${targetPageId}:`, error);
-          }
-        };
-
-        targetPage.on("framenavigated", navigationMetadataListener);
+        attachNavigationMetadataListener(targetPage);
 
         // Setup screencast for the target page
         targetClient = await targetPage.target().createCDPSession();
@@ -404,6 +609,9 @@ export async function handleCastSession(
               }
               case "navigation": {
                 const { event } = data as NavigationEvent;
+                lastNavigationAt = Date.now();
+                consecutiveRetryableFailures = 0;
+                reattachAttempts = 0;
                 await navigatePage(event, targetPage);
                 break;
               }
@@ -452,62 +660,6 @@ export async function handleCastSession(
           }
         });
 
-        const captureFrame = async () => {
-          if (!targetClient || !targetPage || ws.readyState !== WebSocket.OPEN) {
-            return;
-          }
-
-          try {
-            const screenshot = (await targetClient.send("Page.captureScreenshot", {
-              format: "jpeg",
-              quality: 75,
-              fromSurface: true,
-            })) as { data?: string };
-
-            if (!screenshot.data) {
-              throw new Error("Screenshot payload was empty.");
-            }
-
-            hasReceivedFirstFrame = true;
-            if (firstFrameTimeout) {
-              clearTimeout(firstFrameTimeout);
-              firstFrameTimeout = null;
-            }
-
-            ws.send(
-              JSON.stringify({
-                pageId: targetPageId,
-                url: targetPage.url(),
-                title: cachedPageTitle,
-                favicon: cachedPageFavicon,
-                data: screenshot.data,
-              }),
-            );
-          } catch (error) {
-            const message = error instanceof Error ? error.message : String(error);
-            const isTargetClosed = message.includes("Target closed") || message.includes("Session closed");
-
-            if (!isTargetClosed && ws.readyState === WebSocket.OPEN) {
-              console.error(`Error capturing screenshot for pageId=${targetPageId}:`, error);
-              ws.send(
-                JSON.stringify({
-                  type: "castError",
-                  pageId: targetPageId,
-                  error: message,
-                }),
-              );
-            }
-
-            handleSessionCleanup();
-            ws.close();
-            return;
-          }
-
-          captureIntervalTimeout = setTimeout(() => {
-            void captureFrame();
-          }, CAPTURE_INTERVAL_MS);
-        };
-
         void captureFrame();
 
         // Cleanup when target is destroyed
@@ -519,17 +671,11 @@ export async function handleCastSession(
 
               if (pageId === targetPageId) {
                 if (ws.readyState === WebSocket.OPEN) {
-                  ws.send(
-                    JSON.stringify({
-                      type: "targetClosed",
-                      pageId: targetPageId,
-                    }),
-                  );
+                  closeStreamWithError({
+                    type: "targetClosed",
+                    pageId: targetPageId,
+                  });
                 }
-
-                // Cleanup and close connection
-                handleSessionCleanup();
-                ws.close();
               }
             } catch (err) {
               console.error("Error handling destroyed target:", err);
