@@ -178,42 +178,43 @@ export const handleGetSessionLiveDetails = async (
 
     const pagesInfo = await Promise.all(
       pages.map(async (page) => {
+        const pageId = page.target()._targetId;
+        const url = page.url();
+
+        let title = "";
         try {
-          const pageId = page.target()._targetId;
-
-          const title = await page.title();
-
-          let favicon: string | null = null;
-          try {
-            favicon = await page.evaluate(() => {
-              const iconLink = document.querySelector(
-                'link[rel="icon"], link[rel="shortcut icon"]',
-              );
-              if (iconLink) {
-                const href = iconLink.getAttribute("href");
-                if (href?.startsWith("http")) return href;
-                if (href?.startsWith("//")) return window.location.protocol + href;
-                if (href?.startsWith("/")) return window.location.origin + href;
-                return window.location.origin + "/" + href;
-              }
-              return null;
-            });
-          } catch (error) {}
-
-          return {
-            id: pageId,
-            url: page.url(),
-            title,
-            favicon,
-          };
+          title = await page.title();
         } catch (error) {
-          console.error("Error collecting page info:", error);
-          return null;
+          console.error("Error collecting page title:", error);
         }
+
+        let favicon: string | null = null;
+        try {
+          favicon = await page.evaluate(() => {
+            const iconLink = document.querySelector(
+              'link[rel="icon"], link[rel="shortcut icon"]',
+            );
+            if (iconLink) {
+              const href = iconLink.getAttribute("href");
+              if (href?.startsWith("http")) return href;
+              if (href?.startsWith("//")) return window.location.protocol + href;
+              if (href?.startsWith("/")) return window.location.origin + href;
+              return window.location.origin + "/" + href;
+            }
+            return null;
+          });
+        } catch (error) {
+          console.error("Error collecting page favicon:", error);
+        }
+
+        return {
+          id: pageId,
+          url,
+          title,
+          favicon,
+        };
       }),
     );
-
-    const validPagesInfo = pagesInfo.filter((page) => page !== null);
 
     const browserVersion = await server.cdpService.getBrowserVersionString();
 
@@ -225,11 +226,11 @@ export const handleGetSessionLiveDetails = async (
         width: 1920,
         height: 1080,
       },
-      pageCount: validPagesInfo.length,
+      pageCount: pagesInfo.length,
     };
 
     return reply.send({
-      pages: validPagesInfo,
+      pages: pagesInfo,
       browserState,
       websocketUrl: server.sessionService.activeSession.websocketUrl,
       sessionViewerUrl: server.sessionService.activeSession.sessionViewerUrl,
