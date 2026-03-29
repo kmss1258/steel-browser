@@ -121,6 +121,37 @@ docker compose -f docker-compose.dev.yml up --build
 
 If you run on a custom host, create a `.env` file (see `docs/DEVELOPMENT_SETUP.md` for variables) or modify the environment variables used by `docker-compose.dev.yml` to use your host.
 
+### Contributor Note: `live-details` Stability During Navigation
+
+When debugging session viewers or any control-plane integration that depends on `GET /v1/sessions/:id/live-details`, treat cross-site navigation as a transiently unstable read window.
+
+- `live-details` is built from the current `browser.pages()` snapshot.
+- Each page also collects extra metadata such as `title` and `favicon`.
+- Historically, metadata collection failures during navigation could cause a page to disappear from `pages[]`, which then surfaced as downstream `recovering`, `page_not_found`, or stale-route behavior in higher layers.
+
+The current implementation keeps the page in `pages[]` even if `page.title()` or favicon extraction fails temporarily. Only metadata is allowed to degrade; page identity should remain visible to callers.
+
+If this class of issue comes back, verify these in order:
+
+1. Poll raw Steel `live-details` directly during repeated navigation and check whether `pages[]` or `browserState.pageCount` drops unexpectedly.
+2. Compare raw Steel `live-details` with any downstream control-plane shell or viewer payloads before debugging frontend state.
+3. Check whether the failure is page enumeration, or only metadata collection (`title` / `favicon`) churn.
+
+Useful local checks:
+
+```bash
+# Raw session list
+curl http://localhost:3000/v1/sessions
+
+# Raw live-details for one session
+curl http://localhost:3000/v1/sessions/<SESSION_ID>/live-details
+
+# Rebuild only the API after changing live-details behavior
+npm run build -w api
+```
+
+Recommended rule for future changes: page identity (`id`, `url`) should be more durable than page metadata (`title`, `favicon`). Do not drop a page from `live-details` just because metadata collection is transiently unavailable.
+
 ### Node.js
 Alternatively, if you have Node.js and Chrome installed, you can run both the server and the UI directly:
 
