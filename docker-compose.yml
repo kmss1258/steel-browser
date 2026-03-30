@@ -1,6 +1,10 @@
 services:
   api:
-    image: ghcr.io/steel-dev/steel-browser-api:latest
+    build:
+      context: .
+      dockerfile: ./api/Dockerfile
+      args:
+        NODE_VERSION: 22.13.0
     ports:
       - "${STEEL_API_PORT:-12200}:3000"
       - "9223:9223"
@@ -13,7 +17,7 @@ services:
       - STEEL_API_PORT=${STEEL_API_PORT:-12200}
       - DOMAIN=${DOMAIN:-${APP_HOST:-192.168.50.251}:${STEEL_API_PORT:-12200}}
       - CDP_DOMAIN=${CDP_DOMAIN:-localhost:9223}
-      - CHROME_HEADLESS=${CHROME_HEADLESS:-false}
+      - CHROME_HEADLESS=${CHROME_HEADLESS:-true}
       - LOG_STORAGE_ENABLED=true
       - LOG_STORAGE_PATH=/data/logs/browser-logs.duckdb
     networks:
