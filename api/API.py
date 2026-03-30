@@ -20,7 +20,7 @@ from websockets.sync.client import connect
 from websockets.sync.connection import Connection
 
 
-BASE_HTTP_URL = os.getenv("STEEL_HTTP_URL", "http://127.0.0.1:3001")
+BASE_HTTP_URL = os.getenv("STEEL_HTTP_URL", "http://127.0.0.1:12200")
 FRAMES_DIR = Path(os.getenv("STEEL_FRAMES_DIR", "./frames"))
 DEFAULT_DIMENSIONS = {"width": 1356, "height": 763}
 JsonDict = dict[str, object]
