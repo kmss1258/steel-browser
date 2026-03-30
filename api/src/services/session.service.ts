@@ -40,7 +40,7 @@ const defaultSession = {
   debugUrl: getUrl("v1/sessions/debug"),
   debuggerUrl: getUrl("v1/devtools/inspector.html"),
   sessionViewerUrl: getBaseUrl(),
-  dimensions: { width: 1920, height: 1080 },
+  dimensions: { width: 1356, height: 763 },
   userAgent: "",
   antiDetection: { enabled: true as const, preset: "default" as const, mode: "strict" as const },
   isSelenium: false,

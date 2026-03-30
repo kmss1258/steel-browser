@@ -45,7 +45,7 @@ const PRESET_CONFIGS: Record<AntiDetectionPreset, AntiDetectionPresetConfig> = {
     vendor: "Google Inc.",
     userAgent: DEFAULT_WINDOWS_KR_USER_AGENT,
     device: "desktop",
-    dimensions: { width: 1920, height: 1080 },
+    dimensions: { width: 1356, height: 763 },
     fingerprintLocales: ["ko", "en-US", "en", "ja"],
     fingerprintOperatingSystems: ["windows"],
     navigationHeaders: {
@@ -89,7 +89,7 @@ const PRESET_CONFIGS: Record<AntiDetectionPreset, AntiDetectionPresetConfig> = {
     vendor: "Google Inc.",
     userAgent: DEFAULT_WINDOWS_KR_USER_AGENT,
     device: "desktop",
-    dimensions: { width: 1920, height: 1080 },
+    dimensions: { width: 1356, height: 763 },
     fingerprintLocales: ["ko", "en-US", "en", "ja"],
     fingerprintOperatingSystems: ["windows"],
     navigationHeaders: {

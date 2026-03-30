@@ -153,11 +153,11 @@ export async function isSimilarConfig(
   const currentSkipFingerprint = current.skipFingerprintInjection ?? false;
   const nextSkipFingerprint = next.skipFingerprintInjection ?? false;
 
-  const currentWidth = current.dimensions?.width ?? 1920;
-  const nextWidth = next.dimensions?.width ?? 1920;
+  const currentWidth = current.dimensions?.width ?? 1356;
+  const nextWidth = next.dimensions?.width ?? 1356;
 
-  const currentHeight = current.dimensions?.height ?? 1080;
-  const nextHeight = next.dimensions?.height ?? 1080;
+  const currentHeight = current.dimensions?.height ?? 763;
+  const nextHeight = next.dimensions?.height ?? 763;
 
   const {
     session: _s1,

@@ -873,10 +873,12 @@ export class CDPService extends EventEmitter {
                 browsers: [{ name: "chrome", minVersion: 136 }],
                 locales: antiDetection?.fingerprintLocales || ["en-US", "en"],
                 screen: {
-                  minWidth: this.launchConfig!.dimensions?.width ?? antiDetection?.dimensions.width ?? 1920,
-                  minHeight: this.launchConfig!.dimensions?.height ?? antiDetection?.dimensions.height ?? 1080,
-                  maxWidth: this.launchConfig!.dimensions?.width ?? antiDetection?.dimensions.width ?? 1920,
-                  maxHeight: this.launchConfig!.dimensions?.height ?? antiDetection?.dimensions.height ?? 1080,
+                  minWidth: this.launchConfig!.dimensions?.width ?? antiDetection?.dimensions.width ?? 1356,
+                  minHeight:
+                    this.launchConfig!.dimensions?.height ?? antiDetection?.dimensions.height ?? 763,
+                  maxWidth: this.launchConfig!.dimensions?.width ?? antiDetection?.dimensions.width ?? 1356,
+                  maxHeight:
+                    this.launchConfig!.dimensions?.height ?? antiDetection?.dimensions.height ?? 763,
                 },
               };
 
@@ -1057,8 +1059,8 @@ export class CDPService extends EventEmitter {
           this.launchConfig.dimensions ? "" : "--start-maximized",
           `--remote-debugging-address=${env.HOST}`,
           "--remote-debugging-port=9222",
-          `--window-size=${this.launchConfig.dimensions?.width ?? 1920},${
-            this.launchConfig.dimensions?.height ?? 1080
+          `--window-size=${this.launchConfig.dimensions?.width ?? 1356},${
+            this.launchConfig.dimensions?.height ?? 763
           }`,
           userAgent ? `--user-agent=${userAgent}` : "",
           this.launchConfig.options.proxyUrl
@@ -1336,7 +1338,7 @@ export class CDPService extends EventEmitter {
   }
 
   public getDimensions() {
-    return this.currentSessionConfig?.dimensions || { width: 1920, height: 1080 };
+    return this.currentSessionConfig?.dimensions || { width: 1356, height: 763 };
   }
 
   public getFingerprintData(): BrowserFingerprintWithHeaders | null {
