@@ -45,11 +45,29 @@ git clone git@github.com:kmss1258/steel-browser-front.git
 
 가장 먼저 브라우저 런타임을 띄운다.
 
-중요: 현재 기준으로는 prebuilt compose가 아니라 로컬 안정화가 반영된 dev compose를 쓰는 편이 맞다.
+기본 `docker-compose.yml` 기준으로도 로컬 `api/` 이미지가 build 되므로, plain `docker compose up` 만으로도 현재 API 변경이 반영된다.
+현재 기본 compose 설정 기준 fresh session 기본값은 다음과 같다.
+
+- `headless=true`
+- `dimensions=1356x763`
 
 ```bash
 cd ~/workspace/steel-browser
-CHROME_HEADLESS=false docker compose -f docker-compose.dev.yml up -d --build
+docker compose up -d --build
+```
+
+headful 로 띄워야 하면 명시적으로 override 한다.
+
+```bash
+cd ~/workspace/steel-browser
+CHROME_HEADLESS=false docker compose up -d --build
+```
+
+UI까지 로컬 소스로 함께 build 해야 하면 dev compose 를 사용한다.
+
+```bash
+cd ~/workspace/steel-browser
+docker compose -f docker-compose.dev.yml up -d --build
 ```
 
 정상 확인:

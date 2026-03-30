@@ -101,6 +101,10 @@ Alternatively, you can run the API and UI separately with docker compose:
 docker compose up
 ```
 
+Note:
+- The default `docker-compose.yml` now builds the local `api/` image, so plain `docker compose up` reflects local API changes.
+- With the current default compose settings, fresh browser sessions start with `headless=true` and default dimensions `1356x763` unless you override them explicitly.
+
 For Mac Silicon users, you will need to pass this env flag to the Docker compose command to run the images on the correct platform:
 ```bash
 DOCKER_DEFAULT_PLATFORM=linux/arm64 docker compose up
@@ -108,6 +112,8 @@ DOCKER_DEFAULT_PLATFORM=linux/arm64 docker compose up
 
 ## Quickstart for Contributors
 When developing locally, you will need to run the [`docker-compose.dev.yml`](./docker-compose.dev.yml) file instead of the default [`docker-compose.yml`](./docker-compose.yml) file so that your local changes are reflected. Doing this will build the Docker images from the [`api`](./api) and [`ui`](./ui) directories and run the server and UI on port 3000 and 5173 respectively.
+
+The default compose file also builds the local `api/` image now. The main difference is that `docker-compose.dev.yml` additionally builds the local `ui/` image as well.
 
 ```bash
 docker compose -f docker-compose.dev.yml up
