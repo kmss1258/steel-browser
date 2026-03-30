@@ -1,13 +1,13 @@
 # Steel Browser API
 
-이 문서는 Steel API가 포트 `3001`에서 노출하는 브라우저 제어/보기 인터페이스를 설명합니다.
+이 문서는 Steel API가 포트 `12200`에서 노출하는 브라우저 제어/보기 인터페이스를 설명합니다.
 
 세션 생성과 일반 브라우저 동작은 HTTP로 처리하고, 실시간 화면 보기와 탭 제어는 WebSocket으로 처리합니다.
 
 ## 기본 URL
 
 ```text
-http://127.0.0.1:3001
+http://127.0.0.1:12200
 ```
 
 배포 환경에서 호스트나 포트가 다르면 그 값으로 바꿔서 쓰면 됩니다.
@@ -37,7 +37,7 @@ http://127.0.0.1:3001
 예시:
 
 ```bash
-curl -X POST http://127.0.0.1:3001/v1/sessions \
+curl -X POST http://127.0.0.1:12200/v1/sessions \
   -H 'Content-Type: application/json' \
   -d '{"dimensions":{"width":1356,"height":763}}'
 ```
@@ -57,7 +57,7 @@ curl -X POST http://127.0.0.1:3001/v1/sessions \
 예시:
 
 ```bash
-curl http://127.0.0.1:3001/v1/sessions/<SESSION_ID>/live-details
+curl http://127.0.0.1:12200/v1/sessions/<SESSION_ID>/live-details
 ```
 
 ### `GET /v1/sessions/debug`
@@ -173,4 +173,4 @@ cast WebSocket을 감싼 HTML 라이브 뷰어를 반환합니다.
 
 - `pageId`는 브라우저 프로세스 단위가 아니라 탭/페이지 단위입니다.
 - 라이브 화면이 필요하면 cast WebSocket을 쓰고, 한 장의 스냅샷이면 screenshot 엔드포인트를 쓰면 됩니다.
-- 예시 포트는 `3001`이지만, 실제 배포 포트에 맞춰 그대로 바꿔서 쓰면 됩니다.
+- 현재 배포 기준 예시 포트는 `12200`이다.

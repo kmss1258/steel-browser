@@ -105,7 +105,7 @@ lsof -i :9223  # CDP port
 kill -9 $(lsof -t -i:3000)
 
 # Use different ports
-export PORT=3001
+export PORT=12200
 export CDP_REDIRECT_PORT=9224
 ```
 

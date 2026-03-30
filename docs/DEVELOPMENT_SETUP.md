@@ -546,7 +546,7 @@ lsof -i :5173
 kill -9 $(lsof -t -i:3000)
 
 # Use different ports
-export PORT=3001
+export PORT=12200
 ```
 
 #### 5. Memory Issues
