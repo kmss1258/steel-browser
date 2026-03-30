@@ -6,10 +6,12 @@ services:
       args:
         NODE_VERSION: 22.13.0
     ports:
-      - "12200:3000"
+      - "${STEEL_API_PORT:-12200}:3000"
       - "9223:9223"
     environment:
-      - DOMAIN=${DOMAIN:-192.168.50.251:12200}
+      - APP_HOST=${APP_HOST:-192.168.50.251}
+      - STEEL_API_PORT=${STEEL_API_PORT:-12200}
+      - DOMAIN=${DOMAIN:-${APP_HOST:-192.168.50.251}:${STEEL_API_PORT:-12200}}
       - CDP_DOMAIN=${CDP_DOMAIN:-localhost:9223}
       - CHROME_HEADLESS=${CHROME_HEADLESS:-false}
     volumes:
